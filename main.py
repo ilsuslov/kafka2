@@ -1,101 +1,107 @@
-import faust
-import json
+import os
 import re
-import time
+import logging
+import faust
 
-# коннект к кафке
+# Конфиг через ENV, чтобы не хардкодить адрес брокера
+BROKER = os.getenv("KAFKA_BROKER", "kafka://localhost:9092")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 app = faust.App(
-    'stream_filter_v2',
-    broker='kafka://localhost:9092',
-    value_serializer='raw'
+    "stream_processor",
+    broker=BROKER,
+    # RocksDB держит таблицы на диске. Данные не потеряются при рестарте воркера
+    store="rocksdb://",
+    value_serializer="json"
 )
 
-# топики
-t_msgs = app.topic('messages', value_serializer='raw')
-t_out = app.topic('filtered_messages', value_serializer='raw')
-t_blk = app.topic('blocked_users', value_serializer='raw')
-t_cens = app.topic('censored_words', value_serializer='raw')
+# Топики строго по ТЗ
+messages_in = app.topic("messages", value_type=dict)
+messages_out = app.topic("filtered_messages", value_type=dict)
+control_topic = app.topic("blocked_users", value_type=dict)
 
-# таблицы (rocksdb под капотом, данные не слетают при рестарте)
-# default=lambda: [] чтобы не было KeyError если юзер первый раз
-blocked_db = app.Table('blocked_users', default=lambda: [])
-words_db = app.Table('censored_dict')
+# Персистентные таблицы состояния
+# Ключ: recipient_id -> Значение: список заблокированных sender_id
+blocked_users = app.Table("blocked_users", default=list)
+# Ключ: "global" -> Значение: список запрещённых слов
+banned_words = app.Table("banned_words", default=list)
 
-# кэш для регекса, чтобы не собирать каждый раз (ну, почти)
-_cached_regex = None
 
-def get_regex():
-    global _cached_regex
-    words = list(words_db.values())
-    if not words:
-        return None
-    
-    # сортируем чтобы длинные слова шли первыми, иначе 'мат' съест 'матрос'
-    words = sorted(words, key=len, reverse=True)
-    pattern = r'\b(' + '|'.join(re.escape(w) for w in words) + r')\b'
-    _cached_regex = re.compile(pattern, re.IGNORECASE)
-    return _cached_regex
+@app.agent(control_topic)
+async def handle_control_events(stream):
+    """
+    Один агент управляет и блокировками, и цензурой.
+    Faust автоматически пишет изменения таблиц в Kafka-changelog,
+    поэтому состояние реплицируется и сохраняется.
+    """
+    async for event in stream:
+        action = event.get("action")
+        if not action:
+            continue
 
-@app.agent(t_blk)
-async def handle_blocks(stream):
-    async for msg in stream:
-        try:
-            d = json.loads(msg)
-            rid = d.get('recipient')
-            blocked = d.get('blocked', [])
-            if rid:
-                blocked_db[rid] = blocked
-                print(f"[BLOCK] {rid} теперь блочит: {blocked}")
-        except Exception as e:
-            print(f"[ERR] блок: {e}")
-
-@app.agent(t_cens)
-async def handle_words(stream):
-    async for msg in stream:
-        try:
-            d = json.loads(msg)
-            w = d.get('word', '').strip().lower()
-            if w:
-                words_db[w] = w
-                print(f"[CENS] добавлено слово: {w}")
-                # сбрасываем кэш, чтобы новый regex собрался
-                global _cached_regex
-                _cached_regex = None
-        except Exception as e:
-            print(f"[ERR] слово: {e}")
-
-@app.agent(t_msgs)
-async def process(stream):
-    async for raw in stream:
-        try:
-            data = json.loads(raw)
-            sender = data['sender']
-            rec = data['recipient']
-            text = data['text']
-
-            # 1. проверка блокировки
-            if sender in blocked_db[rec]:
-                print(f"🚫 dropped: {sender} -> {rec}")
+        # --- Управление блокировками ---
+        if action in ("block", "unblock"):
+            uid, target = event.get("user_id"), event.get("target_id")
+            if not (uid and target):
+                logger.warning("Пропущено событие блокировки: нет user_id или target_id")
                 continue
 
-            # 2. цензура
-            regex = get_regex()
-            if regex:
-                text = regex.sub('***', text)
+            current = blocked_users[uid]
+            if action == "block" and target not in current:
+                # Важно: в Faust нужно присваивать новый список, чтобы сработал changelog
+                blocked_users[uid] = list(set(current + [target]))
+                logger.info(f"🔒 {uid} заблокировал {target}")
+            elif action == "unblock" and target in current:
+                blocked_users[uid] = [x for x in current if x != target]
+                logger.info(f"🔓 {uid} разблокировал {target}")
 
-            data['text'] = text
-            await t_out.send(
-                key=rec.encode(),
-                value=json.dumps(data, ensure_ascii=False).encode()
-            )
-            print(f"✅ passed: {sender} -> {rec}")
-        except KeyError as e:
-            print(f"❌ missing key {e} in message, skip")
-        except Exception as e:
-            print(f"💥 crash processing: {e}")
+        # --- Управление цензурой ---
+        elif action in ("add_word", "remove_word"):
+            word = event.get("word")
+            if not word:
+                continue
 
-if __name__ == '__main__':
-    # кафка иногда тупит на старте, даем ей 2 сек
-    time.sleep(2)
-    print("🚀 starting worker...")
-    app.main()
+            current = banned_words["global"]
+            if action == "add_word" and word not in current:
+                banned_words["global"] = list(set(current + [word]))
+                logger.info(f"🚫 Добавлено слово в банлист: '{word}'")
+            elif action == "remove_word" and word in current:
+                banned_words["global"] = [x for x in current if x != word]
+                logger.info(f"✅ Удалено слово из банлиста: '{word}'")
+
+
+@app.agent(messages_in)
+async def process_and_filter(stream):
+    """
+    Основной пайплайн:
+    1. Проверка, не в блоке ли отправитель у получателя
+    2. Замена запрещённых слов на ***
+    3. Отправка в filtered_messages
+    """
+    async for msg in stream:
+        sender, recipient = msg.get("sender"), msg.get("recipient")
+        content = msg.get("content", "")
+
+        # 1. Блокировка
+        if sender in blocked_users[recipient]:
+            logger.info(f"⛔ Сообщение от {sender} для {recipient} дропнуто (в блоке)")
+            continue
+
+        # 2. Цензура
+        words = banned_words["global"]
+        if words:
+            # \b гарантирует замену целых слов, re.IGNORECASE — регистронезависимо
+            pattern = re.compile(r'\b(' + '|'.join(map(re.escape, words)) + r')\b', re.IGNORECASE)
+            content = pattern.sub("***", content)
+            msg["censored"] = True
+        else:
+            msg["censored"] = False
+
+        msg["content"] = content
+        await messages_out.send(value=msg)
+        logger.info(f"📤 Сообщение {sender}->{recipient} прошло фильтрацию")
